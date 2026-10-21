@@ -1,0 +1,11 @@
+services:
+  instahyre-scraper:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Optional — Instahyre's API answers plain HTTP, so leave this unset
+      # unless you hit HTTP 429 at high volume.
+      # - INSTAHYRE_PROXY=http://user:pass@host:port
