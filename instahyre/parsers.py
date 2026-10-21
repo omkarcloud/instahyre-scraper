@@ -337,9 +337,13 @@ def employer_job(raw):
 
 
 def _media_item(raw):
+    """A press mention on the company page: {id, title, url} -> {id, title, link}."""
     if isinstance(raw, dict):
-        return {k: v for k, v in raw.items() if k != "resource_uri"} or None
-    return S.text(raw)
+        out = {"id": S.to_int(raw.get("id")), "title": S.text(raw.get("title")),
+               "link": S.link(raw.get("url") or raw.get("link"))}
+        return out if out["title"] or out["link"] else None
+    text = S.text(raw)
+    return {"id": None, "title": None, "link": text} if text else None
 
 
 def employer_profile(raw, counts=None, employer_id=None):

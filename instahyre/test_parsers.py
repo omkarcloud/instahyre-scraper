@@ -215,6 +215,15 @@ def test_employer_profile():
     assert P.employer_profile({})["name"] is None
 
 
+def test_media_coverage_items():
+    raw = {"company_name": "Uber", "media_coverage": [
+        {"resource_uri": "/api/v1/brand_page/media/653", "id": 653, "title": "Uber to open 150,000 sq ft office in Hyderabad",
+         "url": "http://www.businessinsider.in/x.cms"}, {"id": 1, "title": "", "url": ""}, "http://example.com/a"]}
+    assert P.employer_profile(raw)["media_coverage"] == [
+        {"id": 653, "title": "Uber to open 150,000 sq ft office in Hyderabad", "link": "http://www.businessinsider.in/x.cms"},
+        {"id": None, "title": None, "link": "http://example.com/a"}]
+
+
 def test_similar_and_lookups():
     sim = [P.similar_job(r) for r in fx("similar_jobs")]
     assert len(sim) == 10 and sim[0]["link"] and sim[0]["company"]["name"]
@@ -344,3 +353,25 @@ def test_lookups_static_fallback(monkeypatch):
     assert lookups.industries()["source"] == "static" and lookups.industries()["count"] == 74
     locs = lookups.locations()
     assert locs["source"] == "static" and locs["count"] > 250
+
+
+# ---- egress: proxy only ----------------------------------------------------------------------------
+
+def test_proxy_only_egress(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "instahyre_proxy", lambda fallback=False: None)
+    monkeypatch.delattr(config, "INSTAHYRE_ALLOW_DIRECT", raising=False)
+    with pytest.raises(fetch.InstahyreUpstreamError, match="never contacted"):
+        fetch._proxy()
+    monkeypatch.setattr(config, "INSTAHYRE_ALLOW_DIRECT", True, raising=False)
+    assert fetch._proxy() is None                       # the open-source kit's opt-in
+    monkeypatch.setattr(config, "instahyre_proxy", lambda fallback=False: "http://user:pass@gw:1")
+    assert fetch._proxy(fallback=True) == "http://user:pass@gw:1"
+
+
+def test_service_config_has_no_direct_mode():
+    import config
+    if getattr(config, "INSTAHYRE_ALLOW_DIRECT", False):
+        pytest.skip("open-source kit: direct mode is its own opt-in")
+    assert config.INSTAHYRE_PROXY_COUNTRY and not getattr(config, "INSTAHYRE_ALLOW_DIRECT", False)
+    assert config.instahyre_proxy() and config.instahyre_proxy(fallback=True)

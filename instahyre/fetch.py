@@ -34,13 +34,15 @@ Referer — the site's own Angular app calls them anonymously):
   company_page(slug)             the /jobs-at-<slug>/ HTML page — only to
                                  read the employer id a slug maps to.
 
-Egress: direct by default (config.INSTAHYRE_PROXY_COUNTRY None). The site
-rate-limits the search API per IP (HTTP 429 after ~50 calls in a minute,
-clears within a minute); a 429 / 403 / 5xx is retried on a fresh sticky
-residential exit (config.instahyre_proxy(fallback=True)). No Cloudflare
-challenge was seen on any surface, HTML pages included; the patchright
-click-through (indeed/fetch.py _browser_page) is the escalation if that
-changes — not built while plain HTTP works.
+Egress: every call rides a proxy exit (config.instahyre_proxy(): a fresh
+sticky residential India exit per session and per retry). Instahyre never
+sees the server's own IP: with no proxy configured the call fails, unless the
+config opts in with INSTAHYRE_ALLOW_DIRECT (the open-source kit does; this
+service never does). The search API rate-limits per IP (HTTP 429 after ~50
+calls in a minute); a 429 / 403 / 5xx is retried on a fresh exit. No
+Cloudflare challenge was seen on any surface, HTML pages included; the
+patchright click-through (indeed/fetch.py _browser_page) is the escalation if
+that changes — not built while plain HTTP works.
 
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   InstahyreUpstreamError  transport failure / 5xx / unexpected body — retryable
@@ -155,6 +157,16 @@ def _drop_session(key):
             pass
 
 
+def _proxy(fallback=False):
+    """The exit for one session. Raises instead of going direct unless the
+    config opts in (config.INSTAHYRE_ALLOW_DIRECT, the open-source kit)."""
+    proxy = config.instahyre_proxy(fallback=fallback)
+    if not proxy and not getattr(config, "INSTAHYRE_ALLOW_DIRECT", False):
+        raise InstahyreUpstreamError("no Instahyre proxy configured (Instahyre is never contacted "
+                                     "from the server's IP)")
+    return proxy
+
+
 def _attempts(label, send):
     """Run send(session) under the retry policy: InstahyreUpstreamError (incl.
     Blocked) retries on a fresh exit up to config.INSTAHYRE_MAX_ATTEMPTS
@@ -162,7 +174,7 @@ def _attempts(label, send):
     attempts = max(1, int(config.INSTAHYRE_MAX_ATTEMPTS))
     last = None
     for attempt in range(1, attempts + 1):
-        proxy = config.instahyre_proxy(fallback=attempt > 1)
+        proxy = _proxy(fallback=attempt > 1)
         key = f"{attempt if proxy else 0}:{proxy or 'direct'}"
         sess = _session(key, proxy)
         try:

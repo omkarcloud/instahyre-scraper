@@ -23,6 +23,7 @@ RETRY_BACKOFF = 2          # seconds, multiplied by the attempt number
 INSTAHYRE_PROXY = os.environ.get("INSTAHYRE_PROXY") or None
 
 # Names the instahyre package reads.
+INSTAHYRE_ALLOW_DIRECT = True               # no INSTAHYRE_PROXY set -> connect directly from this machine
 INSTAHYRE_PROXY_COUNTRY = None              # unused here: INSTAHYRE_PROXY above is the whole proxy policy
 INSTAHYRE_MAX_ATTEMPTS = MAX_RETRIES        # attempts per upstream call
 INSTAHYRE_WORKERS = 6                       # parallel upstream calls in /jobs/search?include_details and /jobs/batch

@@ -67,6 +67,7 @@ def test_job_details():
     assert body["company"]["link"].startswith("https://www.instahyre.com/jobs-at-")
     listing = call("/instahyre/jobs/search", query="python", location="Bangalore")
     job = listing["jobs"][0]
+    bare = call("/instahyre/jobs/details", job=job["id"], include_company="false")
     assert bare["company"]["id"] is None and bare["company"]["name"] == job["company"]["name"]
     closed = call("/instahyre/jobs/details", job=300000, include_company="false")
     assert closed["is_active"] is False and closed["posted_at"] is None
