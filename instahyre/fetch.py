@@ -34,15 +34,21 @@ Referer — the site's own Angular app calls them anonymously):
   company_page(slug)             the /jobs-at-<slug>/ HTML page — only to
                                  read the employer id a slug maps to.
 
-Egress: every call rides a proxy exit (config.instahyre_proxy(): a fresh
-sticky residential India exit per session and per retry). Instahyre never
-sees the server's own IP: with no proxy configured the call fails, unless the
-config opts in with INSTAHYRE_ALLOW_DIRECT (the open-source kit does; this
-service never does). The search API rate-limits per IP (HTTP 429 after ~50
-calls in a minute); a 429 / 403 / 5xx is retried on a fresh exit. No
-Cloudflare challenge was seen on any surface, HTML pages included; the
-patchright click-through (indeed/fetch.py _browser_page) is the escalation if
-that changes — not built while plain HTTP works.
+Egress (2026-11-11): the JSON API rides the Mumbai gateway exit
+(config.INSTAHYRE_API_EXIT = "gateway:in": one session per thread, a fresh gateway
+address per request, so the search API's per-IP limit — HTTP 429 after ~50
+calls in a minute on one address — does not apply); a 429 / 403 / 5xx is
+retried on a fresh session and a call's last retry rides a residential exit.
+The two HTML pages ride a proxy exit (config.instahyre_proxy(): a fresh
+sticky residential India exit per session and per retry), never the gateway:
+from a gateway address Cloudflare answers them 403 "Just a moment..."
+(cf-mitigated: challenge; job page and company page, Mumbai and US gateway
+alike, 2026-11-11), while a residential exit sees no challenge. Instahyre
+never sees the server's own IP: with no proxy configured the call fails,
+unless the config opts in with INSTAHYRE_ALLOW_DIRECT (the open-source kit
+does; this service never does). The patchright click-through
+(indeed/fetch.py _browser_page) is the escalation if the pages are
+challenged on residential exits too — not built while plain HTTP works.
 
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   InstahyreUpstreamError  transport failure / 5xx / unexpected body — retryable
@@ -51,6 +57,7 @@ Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   InstahyreNotFound       no such job / company                     — never retried
 """
 import json
+import fastjson
 import os
 import re
 import sys
@@ -63,16 +70,18 @@ from urllib.parse import urlencode
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import egress
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
 from instahyre import refdata
+from scraper_utils import debug, fanout, memo, sessions
+from scraper_utils.pages import is_challenged
 
 IMPERSONATE = "chrome"
 TIMEOUT = (10, 40)            # (connect, read)
 
-JSON_HEADERS = {"accept": "application/json, text/plain, */*", "accept-language": "en-US,en;q=0.9",
+JSON_HEADERS = {"accept": "application/json, text/plain, */*",
                 "referer": refdata.SEARCH_REFERER, "x-requested-with": "XMLHttpRequest"}
-HTML_HEADERS = {"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "accept-language": "en-US,en;q=0.9"}
+HTML_HEADERS = {"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
 CF_MARKERS = ("just a moment", "challenge-error-text", "cf-chl", "challenge-platform", "attention required")
 
 SEARCH_PATH = "/api/v1/job_search/"
@@ -106,14 +115,7 @@ class InstahyreNotFound(NotFound):
 
 def dump_debug(name, text):
     """Write a raw response to $INSTAHYRE_DEBUG_DIR/<name>.txt for post-mortems."""
-    dbg = os.environ.get("INSTAHYRE_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".txt"), "w") as f:
-                f.write(text)
-        except OSError:
-            pass
+    debug.dump("INSTAHYRE_DEBUG_DIR", name, text)
 
 
 # ---- curl sessions (per thread, keyed by exit) ---------------------------------------------------
@@ -122,44 +124,26 @@ _local = threading.local()
 
 
 def _sessions():
-    store = getattr(_local, "sessions", None)
-    if store is None:
-        store = _local.sessions = OrderedDict()
-    return store
+    return sessions.thread_store(_local)
 
 
 def _session(key, proxy):
-    from curl_cffi import requests as curl_requests
-    store = _sessions()
-    sess = store.get(key)
-    if sess is None:
-        sess = curl_requests.Session(impersonate=IMPERSONATE)
-        if proxy:
-            sess.proxies = {"http": proxy, "https": proxy}
-        store[key] = sess
-        while len(store) > 4:
-            _, old = store.popitem(last=False)
-            try:
-                old.close()
-            except Exception:
-                pass
-    else:
-        store.move_to_end(key)
-    return sess
+    return sessions.keyed(_sessions(), key, lambda: sessions.speaking(
+        egress.new_session(proxy, impersonate=IMPERSONATE), egress.accept_language(proxy)), 4)
 
 
 def _drop_session(key):
-    sess = _sessions().pop(key, None)
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions.drop_keyed(_sessions(), key)
 
 
-def _proxy(fallback=False):
-    """The exit for one session. Raises instead of going direct unless the
-    config opts in (config.INSTAHYRE_ALLOW_DIRECT, the open-source kit)."""
+def _proxy(fallback=False, api=False):
+    """The exit for one session: for a JSON API call (`api`) the gateway exit
+    config.INSTAHYRE_API_EXIT names ("gateway:in"), else config.instahyre_proxy()
+    (a fresh sticky residential exit). Raises instead of going direct unless
+    the config opts in (config.INSTAHYRE_ALLOW_DIRECT, the open-source kit)."""
+    gateway = getattr(config, "INSTAHYRE_API_EXIT", None) if api else None
+    if gateway and egress.gateway_country(gateway):
+        return gateway
     proxy = config.instahyre_proxy(fallback=fallback)
     if not proxy and not getattr(config, "INSTAHYRE_ALLOW_DIRECT", False):
         raise InstahyreUpstreamError("no Instahyre proxy configured (Instahyre is never contacted "
@@ -167,14 +151,19 @@ def _proxy(fallback=False):
     return proxy
 
 
-def _attempts(label, send):
+def _attempts(label, send, api=False):
     """Run send(session) under the retry policy: InstahyreUpstreamError (incl.
     Blocked) retries on a fresh exit up to config.INSTAHYRE_MAX_ATTEMPTS
-    times; BadRequest / NotFound surface at once."""
+    times; BadRequest / NotFound surface at once. `api` = a JSON API call:
+    it rides the gateway exit (config.INSTAHYRE_API_EXIT; one session per
+    thread, a fresh gateway address per request) and its LAST retry the
+    residential exit, so a call the gateway keeps failing still gets one
+    try the old way. The HTML pages never ride the gateway (Cloudflare
+    challenges them from the gateway, see the module docstring)."""
     attempts = max(1, int(config.INSTAHYRE_MAX_ATTEMPTS))
     last = None
     for attempt in range(1, attempts + 1):
-        proxy = _proxy(fallback=attempt > 1)
+        proxy = _proxy(fallback=attempt > 1, api=api and not 1 < attempt == attempts)
         key = f"{attempt if proxy else 0}:{proxy or 'direct'}"
         sess = _session(key, proxy)
         try:
@@ -192,17 +181,10 @@ def _attempts(label, send):
     raise last
 
 
-def is_challenged(status, headers, text):
-    if (headers or {}).get("cf-mitigated") == "challenge":
-        return True
-    head = (text or "")[:4000].lower()
-    return status in (403, 429, 503) and any(m in head for m in CF_MARKERS)
-
-
 def _bad_request_message(text):
     """The API's 400 body is {"<field>": ["message"]} or {"error": "…"}."""
     try:
-        body = json.loads(text)
+        body = fastjson.loads(text)
     except ValueError:
         return (text or "")[:200]
     if isinstance(body, dict):
@@ -235,7 +217,7 @@ def _classify(resp, label, json_body=True):
     if not json_body:
         return text
     try:
-        return json.loads(text)
+        return fastjson.loads(text)
     except ValueError:
         dump_debug("non_json", text)
         raise InstahyreUpstreamError(f"non-JSON answer on {label}")
@@ -255,7 +237,7 @@ def api_get(path, params=None, label=None, expect=dict):
             dump_debug("unexpected", resp.text)
             raise InstahyreUpstreamError(f"unexpected payload on {label}")
         return body
-    return _attempts(label, send)
+    return _attempts(label, send, api=True)
 
 
 def html_get(path, label=None):
@@ -372,19 +354,7 @@ MEMO_MAX = 256
 
 
 def memoized(key, fn, ttl=MEMO_TTL):
-    now = time.monotonic()
-    with _memo_lock:
-        hit = _memo.get(key)
-        if hit and now - hit[0] < ttl:
-            _memo.move_to_end(key)
-            return hit[1]
-    value = fn()
-    with _memo_lock:
-        _memo[key] = (now, value)
-        _memo.move_to_end(key)
-        while len(_memo) > MEMO_MAX:
-            _memo.popitem(last=False)
-    return value
+    return memo.memoized(_memo, _memo_lock, MEMO_MAX, key, fn, ttl)
 
 
 def shared_raw(name, params, build, ttl):
@@ -392,30 +362,13 @@ def shared_raw(name, params, build, ttl):
     the service's response cache (pods share it) when one is installed,
     then build(). Without a `cache` module (the standalone package) it is
     the in-process memo alone."""
-    try:
-        from cache import cached_call
-    except ImportError:
-        cached_call = None
-    seconds = ttl.total_seconds() if hasattr(ttl, "total_seconds") else ttl
-    key = (name, json.dumps(params, sort_keys=True))
-    if cached_call is None:
-        return memoized(key, build, ttl=min(seconds, MEMO_TTL))
-    return memoized(key, lambda: cached_call(f"instahyre.raw.{name}", params, lambda **_: build(), ttl),
-                    ttl=min(seconds, MEMO_TTL))
+    return memo.shared_raw(memoized, "instahyre.raw.", MEMO_TTL, name, params, build, ttl)
 
 
 def run_parallel(fns, workers):
     """Run zero-arg callables in parallel; results align with `fns`. Each
     result is ("ok", value) or ("error", exception)."""
-    def guard(fn):
-        try:
-            return ("ok", fn())
-        except Exception as e:
-            return ("error", e)
-    if not fns:
-        return []
-    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(fns)))) as ex:
-        return list(ex.map(guard, fns))
+    return fanout.guarded_per_call(fns, workers)
 
 
 if __name__ == "__main__":

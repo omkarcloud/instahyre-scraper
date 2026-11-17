@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from instahyre import companies, fetch, jobs, lookups, parsers as P, refdata, refs, schemas, shared as S  # noqa: E402
 from schema_fields import load_query  # noqa: E402
+from scraper_utils.testing import hosted_only
 
 FX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
@@ -375,3 +376,69 @@ def test_service_config_has_no_direct_mode():
         pytest.skip("open-source kit: direct mode is its own opt-in")
     assert config.INSTAHYRE_PROXY_COUNTRY and not getattr(config, "INSTAHYRE_ALLOW_DIRECT", False)
     assert config.instahyre_proxy() and config.instahyre_proxy(fallback=True)
+
+
+# ---- egress: the JSON API on the gateway, the HTML pages on the residential exit -----------------------
+
+@hosted_only
+def test_api_rides_the_gateway_and_pages_never_do(monkeypatch):
+    import config
+    sessions = []
+
+    class Sess:
+        def __init__(self, exit):
+            self.exit, self.headers = exit, {}
+
+        def close(self):
+            pass
+
+    def new_session(exit, impersonate=None):
+        sessions.append(exit)
+        return Sess(exit)
+
+    monkeypatch.setattr(config, "instahyre_proxy", lambda fallback=False: "http://user:pass@resi:1")
+    monkeypatch.setattr(config, "INSTAHYRE_API_EXIT", "gateway:in", raising=False)
+    monkeypatch.setattr(config, "INSTAHYRE_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(fetch.egress, "new_session", new_session)
+    monkeypatch.setattr(fetch.time, "sleep", lambda s: None)
+    monkeypatch.setattr(fetch, "_local", fetch.threading.local())
+
+    assert fetch._proxy(api=True) == "gateway:in" and fetch._proxy() == "http://user:pass@resi:1"
+    # healthy: one gateway session serves API call after API call
+    assert [fetch._attempts("x", lambda s: s.exit, api=True) for _ in range(3)] == ["gateway:in"] * 3
+    assert sessions == ["gateway:in"]
+    # the gateway refuses twice: the last retry rides the residential exit
+    seen = []
+
+    def send(sess):
+        seen.append(sess.exit)
+        if sess.exit == "gateway:in":
+            raise fetch.InstahyreBlocked("HTTP 403")
+        return "ok"
+
+    assert fetch._attempts("x", send, api=True) == "ok"
+    assert seen == ["gateway:in", "gateway:in", "http://user:pass@resi:1"]
+    # an HTML page never rides the gateway, on any attempt
+    seen.clear()
+
+    def page(sess):
+        seen.append(sess.exit)
+        raise fetch.InstahyreBlocked("challenge (HTTP 403)")
+
+    with pytest.raises(fetch.InstahyreBlocked):
+        fetch._attempts("page", page)
+    assert seen == ["http://user:pass@resi:1"] * 3
+    # no gateway named (None, a country, the kit's config without the knob): the API rides the proxy exit as before
+    for value in (None, "in"):
+        monkeypatch.setattr(config, "INSTAHYRE_API_EXIT", value, raising=False)
+        assert fetch._proxy(api=True) == "http://user:pass@resi:1"
+    monkeypatch.delattr(config, "INSTAHYRE_API_EXIT", raising=False)
+    assert fetch._proxy(api=True) == "http://user:pass@resi:1"
+
+
+def test_service_api_exit_is_the_mumbai_gateway():
+    import config
+    if getattr(config, "INSTAHYRE_ALLOW_DIRECT", False):
+        pytest.skip("open-source kit: direct mode is its own opt-in")
+    assert config.INSTAHYRE_API_EXIT == "gateway:in" and fetch._proxy(api=True) == "gateway:in"
+    assert fetch.egress.exit_country(fetch._proxy()) == "in" and not config.gateway_exit(fetch._proxy())       # the pages: a proxy URL pinned to India

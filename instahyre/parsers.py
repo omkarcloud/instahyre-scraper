@@ -9,7 +9,7 @@ null for an anonymous client), `candidate_title` (the title plus
 `previous_slug`, the search meta's `facet_all_counts` (the total repeated
 per facet), `job_experience_levels` (a sitewide histogram, identical for
 every query) and `next` / `previous` (rebuilt as this API's pagination)."""
-import json
+import fastjson
 import re
 from math import ceil
 
@@ -133,7 +133,7 @@ def job_posting_ld(html):
     None when the page carries none (closed ads)."""
     for block in _LD_RE.findall(html or ""):
         try:
-            data = json.loads(block.strip())
+            data = fastjson.loads(block.strip())
         except ValueError:
             continue
         if not isinstance(data, dict) or data.get("@type") != "JobPosting":
